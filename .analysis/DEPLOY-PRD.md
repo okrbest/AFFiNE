@@ -136,22 +136,36 @@ yarn affine build -p @affine/mobile
 
 **파일 위치**: 프로젝트 루트에 `Dockerfile` 생성 또는 `.github/deployment/node/Dockerfile` 파일 사용
 
+**중요**: Migration job에서 `prisma` CLI를 사용하려면 node_modules가 포함되어야 합니다!
+
 ```dockerfile
-# 프로덕션 배포용 Dockerfile
+# 프로덕션 배포용 Dockerfile (Prisma 지원)
 FROM node:22-bookworm-slim
 
-# 빌드된 파일을 이미지로 복사
+# 필수 시스템 패키지 설치
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends openssl libjemalloc2 && \
+  rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 의존성 파일 먼저 복사 (Docker 레이어 캐싱 최적화)
+COPY ./packages/backend/server/package.json ./packages/backend/server/yarn.lock* ./
+COPY ./packages/backend/server/prisma ./prisma
+
+# 의존성 설치 (prisma CLI 포함)
+RUN corepack enable && \
+  yarn install --production --frozen-lockfile && \
+  yarn cache clean
+
+# Prisma Client 생성
+RUN yarn prisma generate
+
+# 나머지 애플리케이션 파일 복사
 COPY ./packages/backend/server /app
 COPY ./packages/frontend/apps/web/dist /app/static
 COPY ./packages/frontend/admin/dist /app/static/admin
 COPY ./packages/frontend/apps/mobile/dist /app/static/mobile
-
-WORKDIR /app
-
-# 필수 시스템 패키지 설치
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends openssl libjemalloc2 && \
-    rm -rf /var/lib/apt/lists/*
 
 # jemalloc 메모리 할당자 활성화 (성능 향상)
 ENV LD_PRELOAD=libjemalloc.so.2
@@ -160,6 +174,13 @@ EXPOSE 3010
 
 CMD ["node", "./dist/main.js"]
 ```
+
+**변경 사항 설명**:
+
+- `yarn install`로 node_modules 설치 (prisma CLI 포함)
+- `prisma generate`로 Prisma Client 생성
+- Docker 레이어 캐싱을 활용한 빌드 최적화
+- Migration job에서 `yarn prisma migrate deploy` 실행 가능
 
 #### 3-2. Docker Compose 파일 생성 (파일 작성)
 

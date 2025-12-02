@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": ["Bash(yarn affine --help:*)"],
+    "deny": [],
+    "ask": []
+  }
+}
