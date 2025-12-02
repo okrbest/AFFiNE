@@ -1,0 +1,340 @@
+# AFFiNE 개발 서버 배포 워크플로우
+#
+# 이 워크플로우는 다음 단계를 수행합니다:
+# 1. 코드 체크아웃
+# 2. 프로젝트 빌드
+# 3. Docker 이미지 생성
+# 4. Docker Registry에 푸시
+# 5. SSH로 개발 서버 접속
+# 6. Docker Compose 재시작
+#
+# 필요한 GitHub Secrets:
+# - DOCKER_REGISTRY: Docker 레지스트리 URL (예: docker.io, ghcr.io, your-registry.com)
+# - DOCKER_USERNAME: Docker 레지스트리 사용자명
+# - DOCKER_PASSWORD: Docker 레지스트리 비밀번호 또는 토큰
+# - DEV_SERVER_HOST: 개발 서버 IP 또는 도메인
+# - DEV_SERVER_USER: SSH 사용자명
+# - DEV_SERVER_SSH_KEY: SSH 개인키 (PEM 형식)
+# - DEV_SERVER_PORT: SSH 포트 (선택, 기본값: 22)
+# - DEPLOY_PATH: 서버의 docker-compose.yml 경로 (선택, 기본값: ~/affine)
+
+name: Build and Deploy to Dev Server
+
+on:
+  # 수동 실행
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '배포 환경'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+      image_tag:
+        description: 'Docker 이미지 태그 (비워두면 커밋 해시 사용)'
+        required: false
+        type: string
+
+  # main/canary 브랜치 푸시 시 자동 실행 (선택적으로 활성화)
+  # push:
+  #   branches:
+  #     - main
+  #     - canary
+
+env:
+  # Docker 이미지 이름
+  IMAGE_NAME: affine
+  # Node.js 버전
+  NODE_VERSION: '22'
+
+jobs:
+  # ============================================
+  # 1단계: 빌드
+  # ============================================
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      # 코드 체크아웃
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 이미지 태그 결정
+      - name: Set image tag
+        id: meta
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
+      # Node.js 설정
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Corepack 활성화 (Yarn 4.x 사용)
+      - name: Enable Corepack
+        run: corepack enable
+
+      # Yarn 캐시 설정
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - name: Cache yarn dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      # Rust 설정 (서버 네이티브 모듈 빌드용)
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: '1.87.0'
+
+      # Rust 캐시
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/backend/native
+            packages/frontend/native
+            packages/common/native
+
+      # 의존성 설치
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # 서버 네이티브 모듈 빌드
+      - name: Build server native module
+        run: yarn affine @affine/server-native build
+
+      # 프론트엔드 빌드
+      - name: Build web application
+        run: yarn affine @affine/web build
+
+      - name: Build admin panel
+        run: yarn affine @affine/admin build
+
+      - name: Build mobile web
+        run: yarn affine @affine/mobile build
+
+      # 서버 빌드
+      - name: Build reader
+        run: yarn workspace @affine/reader build
+
+      - name: Build server
+        run: yarn workspace @affine/server build
+
+      # Prisma 클라이언트 생성
+      - name: Generate Prisma client
+        run: yarn workspace @affine/server prisma generate
+
+      # 프로덕션 의존성만 설치
+      - name: Install production dependencies
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["x64", "arm64"]'
+          yarn config set --json supportedArchitectures.libc '["glibc"]'
+          yarn workspaces focus @affine/server --production
+
+      # node_modules 이동
+      - name: Move node_modules to server directory
+        run: mv ./node_modules ./packages/backend/server/
+
+      # 빌드 결과물 업로드 (다음 job에서 사용)
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            packages/backend/server/
+            packages/frontend/apps/web/dist/
+            packages/frontend/apps/mobile/dist/
+            packages/frontend/admin/dist/
+            .github/deployment/
+          retention-days: 1
+
+  # ============================================
+  # 2단계: Docker 이미지 빌드 및 푸시
+  # ============================================
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      # 코드 체크아웃 (Dockerfile 필요)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 빌드 결과물 다운로드
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: .
+
+      # Docker Buildx 설정
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # QEMU 설정 (멀티 플랫폼 빌드용)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Docker 레지스트리 로그인
+      - name: Login to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Docker 이미지 빌드 및 푸시
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/deployment/node/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+            ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 이미지 정보 출력
+      - name: Print image info
+        run: |
+          echo "Image pushed successfully!"
+          echo "Tags:"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest"
+
+  # ============================================
+  # 3단계: 개발 서버 배포
+  # ============================================
+  deploy:
+    name: Deploy to Dev Server
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    environment: ${{ inputs.environment || 'dev' }}
+
+    steps:
+      # SSH로 서버 접속 및 배포
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          port: ${{ secrets.DEV_SERVER_PORT || 22 }}
+          script: |
+            set -e
+
+            echo "========================================"
+            echo "AFFiNE 개발 서버 배포 시작"
+            echo "========================================"
+
+            # 배포 경로로 이동
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            DEPLOY_PATH="${DEPLOY_PATH:-~/affine}"
+            cd "$DEPLOY_PATH"
+
+            echo "배포 경로: $DEPLOY_PATH"
+            echo "이미지 태그: ${{ needs.build.outputs.image_tag }}"
+
+            # Docker 이미지 풀
+            echo ""
+            echo "[1/3] Docker 이미지 다운로드 중..."
+            docker pull ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+
+            # 기존 컨테이너 중지
+            echo ""
+            echo "[2/3] 기존 컨테이너 중지 중..."
+            docker compose down || true
+
+            # 환경 변수 업데이트 (이미지 태그)
+            echo ""
+            echo "[3/3] 새 컨테이너 시작 중..."
+
+            # docker-compose.yml에서 사용할 이미지 태그 설정
+            export AFFINE_IMAGE="${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+
+            # Docker Compose 실행
+            docker compose up -d
+
+            # 상태 확인
+            echo ""
+            echo "========================================"
+            echo "배포 완료! 컨테이너 상태:"
+            echo "========================================"
+            docker compose ps
+
+            # 헬스 체크 (30초 대기)
+            echo ""
+            echo "헬스 체크 중 (30초 대기)..."
+            sleep 30
+
+            # 서비스 상태 확인
+            if docker compose ps | grep -q "Up"; then
+              echo "✅ 서비스가 정상적으로 실행 중입니다."
+            else
+              echo "❌ 서비스 시작 실패. 로그 확인:"
+              docker compose logs --tail=50
+              exit 1
+            fi
+
+      # 배포 완료 알림 (Slack 등 선택적)
+      - name: Deployment notification
+        if: success()
+        run: |
+          echo "🚀 배포 완료!"
+          echo "서버: ${{ secrets.DEV_SERVER_HOST }}"
+          echo "이미지: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+
+  # ============================================
+  # 실패 시 롤백 (선택적)
+  # ============================================
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [build, docker, deploy]
+    if: failure() && needs.deploy.result == 'failure'
+
+    steps:
+      - name: Rollback to previous version
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          port: ${{ secrets.DEV_SERVER_PORT || 22 }}
+          script: |
+            echo "⚠️ 배포 실패! 이전 버전으로 롤백합니다..."
+
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            DEPLOY_PATH="${DEPLOY_PATH:-~/affine}"
+            cd "$DEPLOY_PATH"
+
+            # latest 태그로 롤백 시도
+            export AFFINE_IMAGE="${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest"
+
+            docker compose down || true
+            docker compose up -d
+
+            echo "롤백 완료. 컨테이너 상태:"
+            docker compose ps
