@@ -1,6 +1,7 @@
 # AFFiNE 프로덕션 배포 가이드
 
 ## 목차
+
 1. [배포 방식 개요](#배포-방식-개요)
 2. [사전 준비](#사전-준비)
 3. [프로덕션 빌드](#프로덕션-빌드)
@@ -17,12 +18,14 @@
 AFFiNE는 두 가지 배포 방식을 지원합니다:
 
 ### 1. 통합 배포 (권장)
+
 - **파일**: `node/Dockerfile`
 - **특징**: Backend 서버가 정적 파일도 함께 서빙
 - **장점**: 설정 간단, 관리 용이
 - **적합**: 중소규모 배포, 단일 서버 환경
 
 ### 2. 분리 배포
+
 - **파일**: `front/Dockerfile`
 - **특징**: Nginx로 정적 파일만 별도 서빙
 - **장점**: 대규모 트래픽 처리에 유리
@@ -37,6 +40,7 @@ AFFiNE는 두 가지 배포 방식을 지원합니다:
 ### SECTION 1: 개발 환경 설치 (로컬 머신에서 실행)
 
 #### 1-1. Node.js 설치
+
 ```bash
 # nvm으로 Node.js 22.16.0 설치
 nvm install 22.16.0
@@ -47,6 +51,7 @@ node --version  # v22.16.0 출력 확인
 ```
 
 #### 1-2. Rust 설치
+
 ```bash
 # Rust 1.87.0 설치
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -59,6 +64,7 @@ rustc --version  # rustc 1.87.0 확인
 ```
 
 #### 1-3. 프로젝트 의존성 설치
+
 ```bash
 # 프로젝트 루트 디렉토리로 이동
 cd /path/to/AFFiNE
@@ -77,24 +83,36 @@ yarn install
 ### SECTION 2: 애플리케이션 빌드 (명령어 실행)
 
 #### 2-1. 네이티브 모듈 빌드
+
 ```bash
 # Rust 네이티브 모듈 빌드 (서버용)
 yarn affine @affine/server-native build
 ```
 
-#### 2-2. 백엔드 빌드
+#### 2-2. reader 모듈 빌드
+
+```bash
+# Reader 모듈 빌드
+yarn affine build -p @affine/reader
+```
+
+#### 2-3. 백엔드 빌드
+
 ```bash
 # NestJS 백엔드 빌드
 yarn affine build -p @affine/server
 ```
 
-#### 2-3. 프론트엔드 빌드
+#### 2-4. 프론트엔드 빌드
+
 ```bash
 # React 웹 애플리케이션 빌드
-yarn affine build -p @affine/web
+# yarn affine build -p @affine/web
+NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/web # memory issue 가 있을 때 사용
 ```
 
-#### 2-4. 선택적 빌드 (필요시)
+#### 2-5. 선택적 빌드 (필요시)
+
 ```bash
 # Admin 패널 빌드
 yarn affine build -p @affine/admin
@@ -104,6 +122,7 @@ yarn affine build -p @affine/mobile
 ```
 
 **빌드 완료 확인**:
+
 - `packages/backend/server/dist/` 디렉토리 확인
 - `packages/frontend/apps/web/dist/` 디렉토리 확인
 
@@ -115,7 +134,7 @@ yarn affine build -p @affine/mobile
 
 #### 3-1. Dockerfile 생성 (파일 작성)
 
-**파일 위치**: 프로젝트 루트에 `Dockerfile` 생성
+**파일 위치**: 프로젝트 루트에 `Dockerfile` 생성 또는 `.github/deployment/node/Dockerfile` 파일 사용
 
 ```dockerfile
 # 프로덕션 배포용 Dockerfile
@@ -144,126 +163,86 @@ CMD ["node", "./dist/main.js"]
 
 #### 3-2. Docker Compose 파일 생성 (파일 작성)
 
-**파일 위치**: 프로젝트 루트에 `docker-compose.yml` 생성
+**파일 위치**: 프로젝트 루트에 `docker-compose.yml` 생성 또는 `.docker/selfhost/compose.yml` 파일 사용
 
 ```yaml
-name: affine-production
-
+name: affine
 services:
-  # PostgreSQL 데이터베이스 (pgvector 지원)
+  affine:
+    #    image: ghcr.io/toeverything/affine:${AFFINE_REVISION:-stable}
+    image: affine-app:latest
+    container_name: affine_server
+    ports:
+      - '${PORT:-3010}:3010'
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      affine_migration:
+        condition: service_completed_successfully
+    volumes:
+      # custom configurations
+      - ${UPLOAD_LOCATION}:/root/.affine/storage
+      - ${CONFIG_LOCATION}:/root/.affine/config
+    env_file:
+      - .env
+    environment:
+      - REDIS_SERVER_HOST=redis
+      - DATABASE_URL=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/${DB_DATABASE:-affine}
+      - AFFINE_INDEXER_ENABLED=false
+    restart: unless-stopped
+
+  affine_migration:
+    #    image: ghcr.io/toeverything/affine:${AFFINE_REVISION:-stable}
+    image: affine-app:latest
+    container_name: affine_migration_job
+    volumes:
+      # custom configurations
+      - ${UPLOAD_LOCATION}:/root/.affine/storage
+      - ${CONFIG_LOCATION}:/root/.affine/config
+    command: ['sh', '-c', 'node ./scripts/self-host-predeploy.js']
+    env_file:
+      - .env
+    environment:
+      - REDIS_SERVER_HOST=redis
+      - DATABASE_URL=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/${DB_DATABASE:-affine}
+      - AFFINE_INDEXER_ENABLED=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis
+    container_name: affine_redis
+    healthcheck:
+      test: ['CMD', 'redis-cli', '--raw', 'incr', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: affine-postgres
+    container_name: affine_postgres
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=affine
-      - POSTGRES_PASSWORD=affine_secure_password_change_me
-      - POSTGRES_DB=affine
-      - POSTGRES_INITDB_ARGS=--data-checksums
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE:-affine}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+      # you better set a password for you database
+      # or you may add 'POSTGRES_HOST_AUTH_METHOD=trust' to ignore postgres security policy
+      POSTGRES_HOST_AUTH_METHOD: trust
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U affine -d affine"]
+      test: ['CMD', 'pg_isready', '-U', '${DB_USERNAME}', '-d', '${DB_DATABASE:-affine}']
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    networks:
-      - affine-network
-
-  # Redis 캐시
-  redis:
-    image: redis:7-alpine
-    container_name: affine-redis
-    healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    networks:
-      - affine-network
-
-  # 데이터베이스 마이그레이션
-  affine-migration:
-    image: affine-app:latest
-    container_name: affine-migration
-    volumes:
-      - affine_config:/root/.affine/config
-    environment:
-      - REDIS_SERVER_HOST=redis
-      - DATABASE_URL=postgresql://affine:affine_secure_password_change_me@postgres:5432/affine
-      - NODE_ENV=production
-    command: ["node", "./scripts/self-host-predeploy.js"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - affine-network
-
-  # AFFiNE 메인 애플리케이션
-  affine:
-    image: affine-app:latest
-    container_name: affine-app
-    ports:
-      - "3010:3010"
-    volumes:
-      - affine_storage:/root/.affine/storage
-      - affine_config:/root/.affine/config
-    environment:
-      # 데이터베이스 연결
-      - DATABASE_URL=postgresql://affine:affine_secure_password_change_me@postgres:5432/affine
-      - REDIS_SERVER_HOST=redis
-
-      # 서버 설정
-      - NODE_ENV=production
-      - AFFINE_SERVER_PORT=3010
-      - AFFINE_SERVER_HOST=0.0.0.0
-
-      # 외부 URL 설정 (실제 도메인으로 변경)
-      # - AFFINE_SERVER_HTTPS=true
-      # - AFFINE_SERVER_EXTERNAL_URL=https://your-domain.com
-
-      # 기능 설정
-      - AFFINE_INDEXER_ENABLED=false
-
-      # (선택) OAuth 설정
-      # - OAUTH_GOOGLE_CLIENT_ID=your_client_id
-      # - OAUTH_GOOGLE_CLIENT_SECRET=your_client_secret
-
-      # (선택) SMTP 설정
-      # - MAILER_HOST=smtp.gmail.com
-      # - MAILER_PORT=587
-      # - MAILER_USER=your_email@gmail.com
-      # - MAILER_PASSWORD=your_password
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      affine-migration:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks:
-      - affine-network
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3010/api/healthz', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-volumes:
-  postgres_data:
-    driver: local
-  affine_storage:
-    driver: local
-  affine_config:
-    driver: local
-
-networks:
-  affine-network:
-    driver: bridge
 ```
 
 #### 3-3. 환경 변수 파일 생성 (선택적, 파일 작성)
@@ -293,6 +272,7 @@ AFFINE_PORT=3010
 ### SECTION 4: 이미지 생성 (명령어 실행)
 
 #### 4-1. Docker 이미지 빌드
+
 ```bash
 # 프로젝트 루트에서 실행
 docker build -t affine-app:latest -f Dockerfile .
@@ -301,6 +281,7 @@ docker build -t affine-app:latest -f Dockerfile .
 **빌드 시간**: 약 5-10분 소요
 
 #### 4-2. 이미지 확인
+
 ```bash
 # 생성된 이미지 목록 확인
 docker images affine-app
@@ -317,18 +298,21 @@ docker images affine-app
 ### SECTION 5: 서비스 시작 (명령어 실행)
 
 #### 5-1. 서비스 시작
+
 ```bash
 # Docker Compose로 모든 서비스 시작
 docker compose up -d
 ```
 
 **실행 순서**:
+
 1. postgres 컨테이너 시작 → 헬스체크 대기
 2. redis 컨테이너 시작 → 헬스체크 대기
 3. affine-migration 실행 (DB 마이그레이션)
 4. affine 애플리케이션 시작
 
 #### 5-2. 서비스 상태 확인
+
 ```bash
 # 컨테이너 상태 확인
 docker compose ps
@@ -341,6 +325,7 @@ docker compose ps
 ```
 
 #### 5-3. 로그 확인
+
 ```bash
 # 전체 서비스 로그 (실시간)
 docker compose logs -f
@@ -353,10 +338,12 @@ docker compose logs -f postgres
 #### 5-4. 접속 확인
 
 **브라우저에서 접속**:
+
 - 로컬: http://localhost:3010
 - 원격: http://서버IP:3010
 
 **첫 로그인**:
+
 - 회원가입 페이지에서 계정 생성
 - 관리자 계정은 첫 번째 가입자에게 자동 부여
 
@@ -365,6 +352,7 @@ docker compose logs -f postgres
 ### SECTION 6: 서비스 관리 명령어
 
 #### 6-1. 서비스 제어
+
 ```bash
 # 서비스 중지
 docker compose down
@@ -380,6 +368,7 @@ docker compose restart affine
 ```
 
 #### 6-2. 컨테이너 접속
+
 ```bash
 # 애플리케이션 컨테이너 쉘 접속
 docker compose exec affine sh
@@ -392,6 +381,7 @@ docker compose exec redis redis-cli
 ```
 
 #### 6-3. 데이터 백업
+
 ```bash
 # PostgreSQL 데이터베이스 백업
 docker compose exec postgres pg_dump -U affine affine > backup_$(date +%Y%m%d).sql
@@ -404,6 +394,7 @@ docker run --rm \
 ```
 
 #### 6-4. 애플리케이션 업데이트
+
 ```bash
 # 1. 새 버전 코드 pull
 git pull origin main
@@ -483,6 +474,7 @@ CMD ["node", "./dist/main.js"]
 ```
 
 **사용법**:
+
 ```bash
 # 멀티 스테이지로 빌드 (로컬 빌드 없이 전부 Docker 안에서)
 docker build -t affine-app:latest -f Dockerfile.multistage .
@@ -543,20 +535,20 @@ server {
 `docker-compose.yml`에 서비스 추가:
 
 ```yaml
-  nginx:
-    image: nginx:alpine
-    container_name: affine-nginx
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - affine
-    restart: unless-stopped
-    networks:
-      - affine-network
+nginx:
+  image: nginx:alpine
+  container_name: affine-nginx
+  ports:
+    - '80:80'
+    - '443:443'
+  volumes:
+    - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    - ./ssl:/etc/nginx/ssl:ro
+  depends_on:
+    - affine
+  restart: unless-stopped
+  networks:
+    - affine-network
 ```
 
 ---
@@ -568,16 +560,16 @@ server {
 `docker-compose.yml`의 `affine` 서비스에 추가:
 
 ```yaml
-  affine:
-    # ... 기존 설정 ...
-    deploy:
-      resources:
-        limits:
-          cpus: '2'          # 최대 2 CPU 코어
-          memory: 2G         # 최대 2GB RAM
-        reservations:
-          cpus: '1'          # 최소 1 CPU 코어
-          memory: 512M       # 최소 512MB RAM
+affine:
+  # ... 기존 설정 ...
+  deploy:
+    resources:
+      limits:
+        cpus: '2' # 최대 2 CPU 코어
+        memory: 2G # 최대 2GB RAM
+      reservations:
+        cpus: '1' # 최소 1 CPU 코어
+        memory: 512M # 최소 512MB RAM
 ```
 
 ---
@@ -605,8 +597,8 @@ docker compose run --rm affine-migration node ./scripts/self-host-predeploy.js
 **해결**: `docker-compose.yml`에서 호스트 포트 변경
 
 ```yaml
-    ports:
-      - "8080:3010"  # 3010 대신 8080 포트 사용
+ports:
+  - '8080:3010' # 3010 대신 8080 포트 사용
 ```
 
 #### 8-3. 데이터베이스 연결 실패
@@ -728,6 +720,7 @@ Docker Compose 설정에서 `affine-migration`과 `affine`이 별도 서비스�
 #### 1. 역할의 차이
 
 - **`affine-migration`**: 일회성 초기화 작업
+
   - 데이터베이스 스키마 생성/업데이트 (Prisma 마이그레이션)
   - 초기 데이터 세팅
   - 실행 후 자동 종료 (상시 실행 X)
@@ -745,7 +738,7 @@ Docker Compose 설정에서 `affine-migration`과 `affine`이 별도 서비스�
 affine:
   depends_on:
     affine-migration:
-      condition: service_completed_successfully  # 마이그레이션 성공 후에만 시작
+      condition: service_completed_successfully # 마이그레이션 성공 후에만 시작
 ```
 
 이렇게 설정하면 안전한 실행 순서가 보장됩니다:
@@ -781,6 +774,7 @@ CMD ["sh", "-c", "node ./scripts/self-host-predeploy.js && node ./dist/main.js"]
 ```
 
 **발생하는 문제**:
+
 - 서버 재시작할 때마다 마이그레이션 재실행 (불필요한 작업)
 - 마이그레이션 실패 시 서버도 시작되지 않음
 - 로그 추적 어려움 (초기화 로그 vs 서버 로그 혼재)
@@ -804,14 +798,14 @@ docker compose ps
 
 #### 6. 비교 표
 
-| 구분 | affine-migration | affine |
-|------|------------------|--------|
-| **역할** | DB 마이그레이션 | 웹 서버 |
-| **실행 타입** | 한 번 실행 후 종료 | 계속 실행 (데몬) |
-| **명령어** | `node ./scripts/self-host-predeploy.js` | `node ./dist/main.js` |
-| **정상 상태** | `Exited (0)` | `Up` |
-| **재시작** | 필요 없음 | 필요 시 재시작 가능 |
-| **로그 유형** | 초기화 로그 | 서버 요청 로그 |
+| 구분          | affine-migration                        | affine                |
+| ------------- | --------------------------------------- | --------------------- |
+| **역할**      | DB 마이그레이션                         | 웹 서버               |
+| **실행 타입** | 한 번 실행 후 종료                      | 계속 실행 (데몬)      |
+| **명령어**    | `node ./scripts/self-host-predeploy.js` | `node ./dist/main.js` |
+| **정상 상태** | `Exited (0)`                            | `Up`                  |
+| **재시작**    | 필요 없음                               | 필요 시 재시작 가능   |
+| **로그 유형** | 초기화 로그                             | 서버 요청 로그        |
 
 #### 7. 유사 패턴
 
