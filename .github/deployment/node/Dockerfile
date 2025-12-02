@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Copy package files for dependency installation
 COPY ./packages/backend/server/package.json ./packages/backend/server/yarn.lock* ./
-COPY ./packages/backend/server/prisma ./prisma
+COPY ./packages/backend/server/schema.prisma ./
 
 # Install dependencies including prisma CLI
 RUN corepack enable && \
