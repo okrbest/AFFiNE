@@ -1,99 +1,50 @@
 # ============================================
-# Stage 1: Builder - 전체 빌드 환경
+# AFFiNE Production Dockerfile (로컬 빌드 방식)
 # ============================================
-FROM node:22-bookworm AS builder
+#
+# 이 Dockerfile은 로컬에서 빌드된 결과물을 Docker 이미지로 패키징합니다.
+#
+# 빌드 전 필수 작업 (로컬 또는 CI에서 실행):
+#   1. yarn install
+#   2. yarn affine @affine/server-native build
+#   3. yarn affine build -p @affine/reader
+#   4. yarn affine build -p @affine/server
+#   5. NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/web
+#   6. NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/admin (선택)
+#   7. NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/mobile (선택)
+#
+# Docker 이미지 빌드:
+#   docker build -t affine-app:latest -f .github/deployment/node/Dockerfile .
+#
 
-# Rust 설치 (네이티브 모듈 빌드용)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# 필수 시스템 패키지
-RUN apt-get update && \
-  apt-get install -y --no-install-recommends \
-    build-essential \
-    python3 \
-    openssl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Yarn 설정 파일 및 의존성 파일 먼저 복사 (캐싱 최적화)
-COPY package.json yarn.lock .yarnrc.yml ./
-COPY .yarn ./.yarn
-
-# Corepack 활성화
-RUN corepack enable
-
-# 전체 소스 코드 복사
-COPY . .
-
-# 의존성 설치
-RUN yarn install --immutable
-
-# 빌드 시 메모리 증가 (heap out of memory 방지)
-ENV NODE_OPTIONS="--max-old-space-size=8192"
-
-# 빌드 실행
-RUN yarn affine @affine/server-native build && \
-    yarn affine build -p @affine/reader && \
-    yarn affine build -p @affine/server && \
-    yarn affine build -p @affine/web && \
-    yarn affine build -p @affine/admin && \
-    yarn affine build -p @affine/mobile
-
-# ============================================
-# Stage 2: Dependencies - 프로덕션 의존성만 설치
-# ============================================
-FROM node:22-bookworm AS deps
-
-WORKDIR /app
-
-# 루트 package.json 복사
-COPY --from=builder /build/package.json /build/yarn.lock /build/.yarnrc.yml ./
-COPY --from=builder /build/.yarn ./.yarn
-
-# 워크스페이스 구조 복사 (package.json들만)
-COPY --from=builder /build/packages/backend/server/package.json ./packages/backend/server/
-COPY --from=builder /build/packages/backend/server/schema.prisma ./packages/backend/server/
-
-# Corepack 활성화 및 프로덕션 의존성 설치
-RUN corepack enable && \
-    yarn workspaces focus @affine/server --production
-
-# Prisma Client 생성
-RUN cd packages/backend/server && yarn prisma generate
-
-# ============================================
-# Stage 3: Production - 최종 런타임 이미지
-# ============================================
 FROM node:22-bookworm-slim
 
-# 필수 런타임 패키지만 설치
+# 필수 런타임 패키지 설치
 RUN apt-get update && \
   apt-get install -y --no-install-recommends openssl libjemalloc2 && \
   rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 프로덕션 의존성 복사
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/packages/backend/server/node_modules ./packages/backend/server/node_modules
+# 빌드된 서버 파일 복사
+COPY ./packages/backend/server/dist ./dist
+COPY ./packages/backend/server/package.json ./
+COPY ./packages/backend/server/schema.prisma ./
+COPY ./packages/backend/server/scripts ./scripts
 
-# 빌드된 서버 코드 복사
-COPY --from=builder /build/packages/backend/server/dist ./dist
-COPY --from=builder /build/packages/backend/server/package.json ./
-COPY --from=builder /build/packages/backend/server/schema.prisma ./
-COPY --from=builder /build/packages/backend/server/scripts ./scripts
+# Node modules 복사 (프로덕션 의존성 포함)
+COPY ./node_modules ./node_modules
+COPY ./packages/backend/server/node_modules ./node_modules
+
+# 네이티브 모듈 복사 (선택적)
+COPY ./packages/backend/native ./native
 
 # 정적 프론트엔드 파일 복사
-COPY --from=builder /build/packages/frontend/apps/web/dist ./static
-COPY --from=builder /build/packages/frontend/admin/dist ./static/admin
-COPY --from=builder /build/packages/frontend/apps/mobile/dist ./static/mobile
+COPY ./packages/frontend/apps/web/dist ./static
+COPY ./packages/frontend/admin/dist ./static/admin
+COPY ./packages/frontend/apps/mobile/dist ./static/mobile
 
-# 빌드 시 설정한 NODE_OPTIONS 제거 (프로덕션에서는 불필요)
-ENV NODE_OPTIONS=""
-
-# jemalloc 메모리 할당자 활성화 (성능 향상)
+# jemalloc 메모리 할당자 활성화
 ENV LD_PRELOAD=libjemalloc.so.2
 
 # 포트 노출
