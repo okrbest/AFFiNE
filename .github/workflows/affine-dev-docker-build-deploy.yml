@@ -1,0 +1,143 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - canary
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - develop
+      - canary
+  workflow_dispatch: # 수동 실행 가능
+
+env:
+  DOCKER_IMAGE: your-dockerhub-username/affine-app # TODO: Docker Hub 사용자명으로 변경
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 전체 히스토리 가져오기 (git 서브모듈용)
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/deployment/node/Dockerfile.multistage
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_OPTIONS=--max-old-space-size=8192
+
+      - name: Image digest
+        run: echo ${{ steps.meta.outputs.tags }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' # PR에서는 배포 안함
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+
+            echo "==> Deploying AFFiNE to production server..."
+
+            # 배포 디렉토리로 이동 (또는 생성)
+            DEPLOY_DIR="${{ secrets.DEPLOY_DIR || '/opt/affine' }}"
+            mkdir -p $DEPLOY_DIR
+            cd $DEPLOY_DIR
+
+            # docker-compose.yml 파일 존재 확인
+            if [ ! -f docker-compose.yml ]; then
+              echo "ERROR: docker-compose.yml not found in $DEPLOY_DIR"
+              echo "Please copy .docker/selfhost/compose.yml to $DEPLOY_DIR/docker-compose.yml"
+              exit 1
+            fi
+
+            # .env 파일 존재 확인
+            if [ ! -f .env ]; then
+              echo "WARNING: .env file not found in $DEPLOY_DIR"
+              echo "Please create .env file with required environment variables"
+            fi
+
+            # Docker Hub에 로그인
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+            # 최신 이미지 다운로드
+            echo "==> Pulling latest Docker image..."
+            docker pull ${{ env.DOCKER_IMAGE }}:latest
+
+            # 기존 서비스 중지
+            echo "==> Stopping existing services..."
+            docker compose down
+
+            # 새 서비스 시작
+            echo "==> Starting new services..."
+            docker compose up -d
+
+            # 서비스 상태 확인
+            echo "==> Checking service status..."
+            docker compose ps
+
+            # 헬스체크 대기 (최대 60초)
+            echo "==> Waiting for health check..."
+            timeout 60 bash -c 'until docker compose ps | grep -q "healthy"; do sleep 2; done' || echo "Warning: Health check timeout"
+
+            # 로그 확인
+            echo "==> Recent logs:"
+            docker compose logs --tail=20 affine
+
+            echo "==> Deployment completed successfully!"
+
+            # Docker 로그아웃
+            docker logout

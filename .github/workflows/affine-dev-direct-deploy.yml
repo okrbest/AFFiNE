@@ -1,0 +1,154 @@
+name: Direct Deploy (SSH Build)
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - canary
+  workflow_dispatch: # 수동 실행 가능
+    inputs:
+      branch:
+        description: 'Branch to deploy'
+        required: false
+        default: 'develop'
+
+jobs:
+  direct-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to server (SSH)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 60m # 빌드 시간이 오래 걸리므로 타임아웃 연장
+          script: |
+            set -e
+
+            echo "=========================================="
+            echo "AFFiNE Direct Deploy (Build on Server)"
+            echo "=========================================="
+
+            # 배포 디렉토리 설정
+            DEPLOY_DIR="${{ secrets.DEPLOY_DIR || '/opt/affine' }}"
+            REPO_URL="${{ secrets.REPO_URL || 'https://github.com/toeverything/AFFiNE.git' }}"
+            BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+
+            echo "==> Configuration:"
+            echo "    Deploy Directory: $DEPLOY_DIR"
+            echo "    Repository: $REPO_URL"
+            echo "    Branch: $BRANCH"
+            echo ""
+
+            # 배포 디렉토리로 이동 (또는 생성)
+            mkdir -p $DEPLOY_DIR
+            cd $DEPLOY_DIR
+
+            # Git 저장소 확인 및 클론/풀
+            if [ -d ".git" ]; then
+              echo "==> Git repository exists, pulling latest changes..."
+              git fetch origin
+              git checkout $BRANCH
+              git pull origin $BRANCH
+            else
+              echo "==> Cloning repository..."
+              git clone -b $BRANCH $REPO_URL .
+            fi
+
+            echo "==> Current commit:"
+            git log -1 --oneline
+
+            # 로컬 빌드 방식 사용 (.github/deployment/node/Dockerfile)
+            echo ""
+            echo "=========================================="
+            echo "Step 1: Building prerequisites locally"
+            echo "=========================================="
+
+            # Node.js와 Yarn 버전 확인
+            echo "==> Checking build environment..."
+            node --version
+            yarn --version
+
+            # 의존성 설치
+            echo "==> Installing dependencies..."
+            yarn install
+
+            # 네이티브 모듈 빌드
+            echo "==> Building native modules..."
+            yarn affine @affine/server-native build
+
+            # Reader 모듈 빌드
+            echo "==> Building reader..."
+            yarn affine build -p @affine/reader
+
+            # 백엔드 빌드
+            echo "==> Building server..."
+            yarn affine build -p @affine/server
+
+            # 프론트엔드 빌드 (메모리 증가)
+            echo "==> Building web app..."
+            NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/web
+
+            # Admin 빌드 (선택)
+            echo "==> Building admin..."
+            NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/admin || echo "Admin build failed, skipping..."
+
+            # Mobile 빌드 (선택)
+            echo "==> Building mobile..."
+            NODE_OPTIONS="--max-old-space-size=8192" yarn affine build -p @affine/mobile || echo "Mobile build failed, skipping..."
+
+            echo ""
+            echo "=========================================="
+            echo "Step 2: Building Docker image"
+            echo "=========================================="
+
+            # Docker 이미지 빌드 (로컬 빌드 결과물 사용)
+            echo "==> Building Docker image..."
+            docker build -t affine-app:latest -f .github/deployment/node/Dockerfile .
+
+            echo ""
+            echo "=========================================="
+            echo "Step 3: Deploying services"
+            echo "=========================================="
+
+            # .env 파일 존재 확인
+            if [ ! -f .docker/selfhost/.env ]; then
+              echo "WARNING: .env file not found in .docker/selfhost/"
+              echo "Please create .env file with required environment variables"
+            fi
+
+            # 기존 서비스 중지
+            echo "==> Stopping existing services..."
+            docker compose -f .docker/selfhost/compose.yml down
+
+            # 새 서비스 시작
+            echo "==> Starting new services..."
+            docker compose -f .docker/selfhost/compose.yml up -d
+
+            # 서비스 상태 확인
+            echo "==> Checking service status..."
+            docker compose -f .docker/selfhost/compose.yml ps
+
+            # 헬스체크 대기 (최대 60초)
+            echo "==> Waiting for health check..."
+            timeout 60 bash -c 'until docker compose -f .docker/selfhost/compose.yml ps | grep -q "healthy"; do sleep 2; done' || echo "Warning: Health check timeout"
+
+            # 로그 확인
+            echo "==> Recent logs:"
+            docker compose -f .docker/selfhost/compose.yml logs --tail=20 affine
+
+            # 사용하지 않는 Docker 이미지 정리
+            echo "==> Cleaning up old Docker images..."
+            docker image prune -f
+
+            echo ""
+            echo "=========================================="
+            echo "Deployment completed successfully!"
+            echo "=========================================="
+            echo "Commit: $(git log -1 --oneline)"
+            echo "Image: affine-app:latest"
+            echo ""

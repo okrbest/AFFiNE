@@ -1,0 +1,140 @@
+# ============================================
+# AFFiNE Production Dockerfile (멀티스테이지 빌드)
+# ============================================
+#
+# 이 Dockerfile은 소스코드부터 프로덕션 이미지까지 완전히 빌드합니다.
+#
+# Docker 이미지 빌드:
+#   docker build -t affine-app:latest -f .github/deployment/node/Dockerfile.multistage .
+#
+# 컨테이너 실행:
+#   docker compose -f .docker/selfhost/compose.yml down
+#   docker compose -f .docker/selfhost/compose.yml up -d
+#
+# 주의사항:
+#   - 빌드 시간이 오래 걸립니다 (20-40분)
+#   - 최소 16GB RAM 권장
+#   - 빌드 캐시를 활용하려면 BuildKit 사용 (DOCKER_BUILDKIT=1)
+
+# ============================================
+# Stage 1: Builder - 전체 빌드 환경
+# ============================================
+FROM node:22-bookworm AS builder
+
+# 빌드 도구 및 Rust 툴체인 설치
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    git \
+    python3 \
+    pkg-config \
+    libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Rust 설치 (네이티브 모듈 빌드용)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Corepack 활성화 (Yarn 4.x 사용)
+RUN corepack enable
+
+WORKDIR /app
+
+# 모든 소스 코드 복사 (postinstall 스크립트가 전체 소스 필요)
+COPY . .
+
+# 의존성 설치
+RUN yarn install --immutable
+
+# 빌드 환경 변수 설정
+ENV NODE_OPTIONS="--max-old-space-size=8192"
+ENV NODE_ENV=production
+
+# 빌드 실행
+# 네이티브 모듈 빌드
+RUN yarn affine @affine/server-native build
+
+# 더미 네이티브 파일 생성 (Webpack 정적 분석 오류 방지)
+RUN cd packages/backend/native && \
+    cp server-native.node server-native.x64.node && \
+    cp server-native.node server-native.arm64.node && \
+    cp server-native.node server-native.armv7.node
+
+# 각 패키지 빌드
+RUN yarn affine build -p @affine/reader
+RUN yarn affine build -p @affine/server
+RUN yarn affine build -p @affine/web
+RUN yarn affine build -p @affine/admin
+RUN yarn affine build -p @affine/mobile
+
+# ============================================
+# Stage 2: Dependencies - 프로덕션 의존성만 설치
+# ============================================
+FROM node:22-bookworm-slim AS deps
+
+RUN corepack enable
+
+WORKDIR /app
+
+# 전체 소스 코드 복사
+COPY --from=builder /app ./
+
+# 프로덕션 의존성만 설치
+RUN yarn workspaces focus --production @affine/server
+
+# ============================================
+# Stage 3: Production - 최종 런타임 이미지
+# ============================================
+FROM node:22-bookworm-slim AS production
+
+# 런타임 필수 패키지 설치
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    openssl \
+    libjemalloc2 \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# 비-root 유저 생성
+RUN groupadd -r affine && useradd -r -g affine affine
+
+WORKDIR /app
+
+# 빌드된 서버 파일 복사
+COPY --from=builder --chown=affine:affine /app/packages/backend/server/dist ./dist
+COPY --from=builder --chown=affine:affine /app/packages/backend/server/package.json ./
+COPY --from=builder --chown=affine:affine /app/packages/backend/server/schema.prisma ./
+COPY --from=builder --chown=affine:affine /app/packages/backend/server/scripts ./scripts
+
+# 프로덕션 node_modules 복사
+COPY --from=deps --chown=affine:affine /app/node_modules ./node_modules
+
+# 네이티브 모듈 복사
+COPY --from=builder --chown=affine:affine /app/packages/backend/native ./native
+
+# 정적 프론트엔드 파일 복사
+COPY --from=builder --chown=affine:affine /app/packages/frontend/apps/web/dist ./static
+COPY --from=builder --chown=affine:affine /app/packages/frontend/admin/dist ./static/admin
+COPY --from=builder --chown=affine:affine /app/packages/frontend/apps/mobile/dist ./static/mobile
+
+# 데이터 디렉토리 생성 및 권한 설정
+RUN mkdir -p /root/.affine/storage /root/.affine/config && \
+    chown -R affine:affine /root/.affine
+
+# jemalloc 메모리 할당자 활성화
+ENV LD_PRELOAD=libjemalloc.so.2
+ENV NODE_ENV=production
+
+# 포트 노출
+EXPOSE 3010
+
+# 헬스체크
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3010/api/healthz', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+# 비-root 유저로 전환
+USER affine
+
+CMD ["node", "./dist/main.js"]
