@@ -1,11 +1,6 @@
 name: Direct Deploy (SSH Build)
 
 on:
-  push:
-    branches:
-      - main
-      - develop
-      - canary
   workflow_dispatch: # 수동 실행 가능
     inputs:
       branch:
