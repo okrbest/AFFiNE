@@ -72,3 +72,21 @@ export const loadingWrapper = style({
   alignItems: 'center',
   justifyContent: 'center',
 });
+export const welcomeMessage = style({
+  padding: '16px 16px 12px 16px',
+  borderBottom: `1px solid ${cssVar('borderColor')}`,
+  background: cssVar('backgroundPrimaryColor'),
+});
+export const welcomeTitle = style({
+  fontSize: cssVar('fontBase'),
+  fontWeight: 600,
+  lineHeight: '24px',
+  color: cssVar('textPrimaryColor'),
+  marginBottom: '4px',
+});
+export const welcomeDescription = style({
+  fontSize: cssVar('fontXs'),
+  fontWeight: 400,
+  lineHeight: '20px',
+  color: cssVar('textSecondaryColor'),
+});

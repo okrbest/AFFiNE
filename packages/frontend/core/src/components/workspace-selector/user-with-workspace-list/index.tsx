@@ -113,6 +113,12 @@ export const UserWithWorkspaceList = ({
 
   return (
     <>
+      <div className={styles.welcomeMessage}>
+        <div className={styles.welcomeTitle}>Welcome to AFFiNE!</div>
+        <div className={styles.welcomeDescription}>
+          Choose a workspace to get started
+        </div>
+      </div>
       <ScrollableContainer
         className={styles.workspaceScrollArea}
         viewPortClassName={styles.workspaceScrollAreaViewport}
